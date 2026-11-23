@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.env
+node_modules/
+.nuxt/
+.output/
+.terraform/
+*.tfstate*
+tfplan
+debug_images/
+coverage/
+.coverage
+playwright-report/
+test-results/

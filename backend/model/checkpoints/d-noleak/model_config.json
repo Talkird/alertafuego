@@ -1,0 +1,6 @@
+{
+  "base_channels": 16,
+  "depth": 3,
+  "threshold": 0.995,
+  "night_threshold": 0.995
+}

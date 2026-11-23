@@ -1,0 +1,28 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+model/dataset/
+# Solo se versionan los dos modelos del sistema
+model/checkpoints/*
+!model/checkpoints/b-shift/
+!model/checkpoints/d-noleak/
+model/*.zip
+debug_images/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+terraform/backend.hcl
+crash.log
+logs/
+model/scene_eval/
+
+# Tests
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+junit.xml

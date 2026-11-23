@@ -1,0 +1,153 @@
+name: Terraform Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "model/data_pipeline/**"
+      - "model/inference/**"
+      - "model/training/**"
+      - "model/__init__.py"
+      - "Dockerfile"
+      - "requirements-lambda.txt"
+      - "terraform/**"
+      - ".github/workflows/terraform-deploy.yml"
+  workflow_dispatch: {}
+
+# Prerequisite: terraform/bootstrap has been applied once, manually, with admin AWS
+# credentials (see terraform/README.md). This workflow only ever assumes the
+# limited-privilege role that bootstrap created.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: terraform-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+  TF_VAR_frontend_origins: ${{ vars.FRONTEND_ORIGINS }}
+  TF_VAR_frontend_url: ${{ vars.FRONTEND_URL }}
+  TF_VAR_alert_email_from: ${{ vars.ALERT_EMAIL_FROM }}
+  TF_VAR_telegram_bot_username: ${{ vars.TELEGRAM_BOT_USERNAME }}
+  TF_VAR_earth_engine_project_id: ${{ vars.EARTH_ENGINE_PROJECT_ID }}
+  TF_VAR_database_url: ${{ secrets.DATABASE_URL }}
+  TF_VAR_detect_api_key: ${{ secrets.DETECT_API_KEY }}
+  TF_VAR_supabase_url: ${{ secrets.SUPABASE_URL }}
+  TF_VAR_ee_service_account_key: ${{ secrets.EE_SERVICE_ACCOUNT_KEY }}
+  TF_VAR_telegram_bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TF_VAR_telegram_webhook_secret: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TFSTATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ vars.TFLOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="key=backend.tfstate"
+
+      # Chicken-and-egg: the Lambda function (applied below) references an image
+      # tag that must already exist in ECR, and the checkpoint download below needs
+      # the artifacts bucket. Create just those first.
+      - name: Terraform apply (ECR repo + artifacts bucket only)
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve -input=false \
+            -target=aws_ecr_repository.app \
+            -target=aws_s3_bucket.model_artifacts \
+            -target=aws_s3_bucket_versioning.model_artifacts \
+            -target=aws_s3_bucket_server_side_encryption_configuration.model_artifacts \
+            -target=aws_s3_bucket_public_access_block.model_artifacts
+
+      - name: Download model checkpoint
+        working-directory: terraform
+        run: |
+          bucket=$(terraform output -raw model_artifacts_bucket)
+          mkdir -p ../model/checkpoints
+          aws s3 cp "s3://$bucket/model_best.pt" ../model/checkpoints/model_best.pt
+          aws s3 cp "s3://$bucket/norm_stats.json" ../model/checkpoints/norm_stats.json
+          # Size and threshold of the model (model/training/config.py). Checkpoints
+          # trained before it existed don't have one; inference then uses the defaults.
+          aws s3 cp "s3://$bucket/model_config.json" ../model/checkpoints/model_config.json || echo "No model_config.json: using defaults"
+          # Other models of the ensemble, one folder each (terraform/artifacts.tf). None: one model.
+          aws s3 cp --recursive "s3://$bucket/ensemble/" ../model/checkpoints/ensemble/
+
+      # The Dockerfile copies the Lambda Web Adapter out of public.ecr.aws. Anonymous
+      # pulls from shared GitHub runner IPs sporadically hit a 429 "Data limit
+      # exceeded", so pre-pull with retries; the build then reuses the local image.
+      - name: Pre-pull Lambda Web Adapter image
+        run: |
+          # Signed-in pulls get a far larger data allowance than anonymous ones,
+          # which shared runner IPs exhaust. Needs ecr-public:GetAuthorizationToken
+          # and sts:GetServiceBearerToken (terraform/bootstrap); until those are
+          # applied, it falls back to pulling anonymously.
+          aws ecr-public get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin public.ecr.aws \
+            || echo "Public ECR login failed, pulling anonymously"
+          image=$(grep -oE 'public\.ecr\.aws/[^ ]+' Dockerfile | head -1)
+          for attempt in 1 2 3 4 5; do
+            docker pull "$image" && exit 0
+            echo "Pull failed (attempt $attempt), retrying in $((attempt * 30))s..."
+            sleep $((attempt * 30))
+          done
+          exit 1
+
+      - name: Build and push image
+        working-directory: terraform
+        run: |
+          repo=$(terraform output -raw ecr_repository_url)
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" | docker login --username AWS --password-stdin "${repo%%/*}"
+          # Without provenance and SBOM: newer runners' Docker attaches them by default,
+          # pushing an OCI image index with an attestation manifest that Lambda rejects
+          # ("image manifest, config or layer media type ... is not supported").
+          docker build --provenance=false --sbom=false -t "$repo:${{ github.sha }}" -t "$repo:latest" ..
+          docker push "$repo:${{ github.sha }}"
+          docker push "$repo:latest"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Deliberately not requirements-lambda.txt/requirements.txt here - alembic's
+      # env.py only imports backend.app.db/models, which don't need torch or
+      # earthengine-api. Installing just what schema migrations need keeps this
+      # step fast.
+      - name: Install migration dependencies
+        run: pip install alembic "sqlalchemy>=2.0" "psycopg[binary]>=3.1" geoalchemy2 python-dotenv
+
+      # Run right before the apply that flips the Lambda to the new image, so the
+      # window where old code (pre-migration schema) and new code (pre-migration
+      # schema too, until this runs) are out of step with the DB stays as short as
+      # possible.
+      - name: Run database migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: alembic upgrade head
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve -input=false -var="image_tag=${{ github.sha }}"
+
+      - name: Show function URL
+        working-directory: terraform
+        run: terraform output -raw function_url

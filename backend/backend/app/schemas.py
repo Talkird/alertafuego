@@ -1,0 +1,299 @@
+"""Pydantic response models for the detection endpoints."""
+
+from datetime import datetime
+from enum import Enum
+from typing import Annotated
+from uuid import UUID
+
+from pydantic import BaseModel, Field, model_validator
+
+
+class ReportVerdict(str, Enum):
+    false_positive = "false_positive"
+    confirmed_fire = "confirmed_fire"
+
+
+class ReportCategory(str, Enum):
+    """Only applicable when verdict is false_positive."""
+
+    industrial_activity = "industrial_activity"
+    controlled_burn = "controlled_burn"
+    gas_flare = "gas_flare"
+    sun_glint = "sun_glint"
+    sensor_noise = "sensor_noise"
+    other = "other"
+
+
+class ReportCreate(BaseModel):
+    verdict: ReportVerdict
+    category: ReportCategory | None = None
+    comment: str | None = None
+
+    @model_validator(mode="after")
+    def _category_matches_verdict(self) -> "ReportCreate":
+        if self.verdict == ReportVerdict.false_positive and self.category is None:
+            raise ValueError("category is required when verdict is false_positive")
+        if self.verdict == ReportVerdict.confirmed_fire and self.category is not None:
+            raise ValueError("category is not applicable when verdict is confirmed_fire")
+        return self
+
+
+class ReportUpdate(BaseModel):
+    """Partial update for an existing report - fields left unset are unchanged."""
+
+    verdict: ReportVerdict | None = None
+    category: ReportCategory | None = None
+    comment: str | None = None
+
+
+class ReportResponse(BaseModel):
+    id: int
+    detection_id: int
+    user_id: UUID
+    verdict: ReportVerdict
+    category: ReportCategory | None
+    comment: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ReportPublic(BaseModel):
+    """Report shape for public listing - omits user_id, reporter identity isn't exposed."""
+
+    id: int
+    verdict: ReportVerdict
+    category: ReportCategory | None
+    comment: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class Detection(BaseModel):
+    lat: float
+    lon: float
+    #: Detection score, comparable across models (model/inference/ensemble.py): 0.5 at
+    #: the threshold of the model surest of the pixel, up to 1. Rows saved before the
+    #: ensemble hold a raw model probability instead.
+    probability: float
+
+
+class BBoxSchema(BaseModel):
+    west: float
+    south: float
+    east: float
+    north: float
+
+
+class DetectionResponse(BaseModel):
+    image_time: datetime
+    bbox: BBoxSchema
+    threshold: float
+    chunk_count: int
+    detection_count: int
+    detections: list[Detection]
+
+
+class StoredDetection(BaseModel):
+    """One row from the `detections` table - shape mirrors the DB schema directly."""
+
+    id: int
+    lat: float
+    lon: float
+    probability: float
+    image_time: datetime
+    detected_at: datetime
+    bbox: BBoxSchema
+    threshold: float
+    report_count: int
+    has_image: bool
+
+
+#: An IGN region code: 2 digits for a province, 5 for a department.
+REGION_CODE_PATTERN = r"^\d{2}(\d{3})?$"
+
+
+#: A polygon's corners as [lat, lon] pairs, not closed (the first isn't repeated).
+LatLon = tuple[Annotated[float, Field(ge=-90, le=90)], Annotated[float, Field(ge=-180, le=180)]]
+PolygonPoints = Annotated[list[LatLon], Field(min_length=3, max_length=200)]
+
+
+def _shapes_given(model: BaseModel) -> list[str]:
+    """Which of the three area shapes a payload sets any field of."""
+    shapes = []
+    if model.lat is not None or model.lon is not None or model.radius_km is not None:
+        shapes.append("circle")
+    if model.polygon is not None:
+        shapes.append("polygon")
+    if model.region_code is not None:
+        shapes.append("region")
+    return shapes
+
+
+class AlertAreaCreate(BaseModel):
+    """A circle (lat, lon and radius_km), a polygon, or a province or department
+    (region_code)."""
+
+    name: str = Field(min_length=1, max_length=100)
+    lat: float | None = Field(None, ge=-90, le=90)
+    lon: float | None = Field(None, ge=-180, le=180)
+    radius_km: float | None = Field(None, gt=0, le=200)
+    polygon: PolygonPoints | None = None
+    region_code: str | None = Field(None, pattern=REGION_CODE_PATTERN)
+    #: Minimum detection score (ensemble.detection_score; every detection has at least
+    #: 0.5). 0.5 by default: alert on every detection, since missing a fire is worse
+    #: than a false alarm (CONFIRM_ALERTS cuts those). On val scenes, 0.65 halves false
+    #: clusters (6.6 to 3.5 per scene) and keeps all strong fires, but a third fewer fires.
+    min_probability: float = Field(0.5, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _one_shape(self) -> "AlertAreaCreate":
+        shapes = _shapes_given(self)
+        if len(shapes) != 1:
+            raise ValueError("give exactly one of: lat, lon and radius_km; polygon; region_code")
+        if shapes == ["circle"] and None in (self.lat, self.lon, self.radius_km):
+            raise ValueError("lat, lon and radius_km are required for a circle area")
+        return self
+
+
+class AlertAreaUpdate(BaseModel):
+    """Partial update - fields left unset are unchanged. lat and lon go together.
+    Setting another shape (a polygon, a region_code, or lat, lon and radius_km)
+    switches the area to it."""
+
+    name: str | None = Field(None, min_length=1, max_length=100)
+    lat: float | None = Field(None, ge=-90, le=90)
+    lon: float | None = Field(None, ge=-180, le=180)
+    radius_km: float | None = Field(None, gt=0, le=200)
+    polygon: PolygonPoints | None = None
+    region_code: str | None = Field(None, pattern=REGION_CODE_PATTERN)
+    min_probability: float | None = Field(None, ge=0, le=1)
+    active: bool | None = None
+
+    @model_validator(mode="after")
+    def _lat_lon_together(self) -> "AlertAreaUpdate":
+        if (self.lat is None) != (self.lon is None):
+            raise ValueError("lat and lon must be updated together")
+        if len(_shapes_given(self)) > 1:
+            raise ValueError("give at most one of: lat, lon and radius_km; polygon; region_code")
+        return self
+
+
+class RegionResponse(BaseModel):
+    """A province or department."""
+
+    code: str
+    name: str
+    #: The department's province code. Null for provinces.
+    province_code: str | None
+
+
+class AlertAreaResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    #: lat, lon and radius_km: set for a circle area, null otherwise.
+    lat: float | None
+    lon: float | None
+    radius_km: float | None
+    #: Set for a polygon area: its corners as [lat, lon], not closed.
+    polygon: list[tuple[float, float]] | None
+    #: Set for a region area.
+    region: RegionResponse | None
+    min_probability: float
+    active: bool
+    created_at: datetime
+
+
+class AlertResponse(BaseModel):
+    """One alert: a detection inside one of the user's alert areas."""
+
+    id: int
+    area_id: int
+    area_name: str
+    created_at: datetime
+    emailed: bool
+    telegram_sent: bool
+    detection: StoredDetection
+
+
+class AccountSettings(BaseModel):
+    email_alerts: bool
+    #: Where email alerts go: the confirmed alternate address, or the account's.
+    alert_email: str
+    #: Whether alert_email is the account's own address.
+    uses_account_email: bool
+    #: An alternate address waiting for its confirmation link, if any.
+    pending_email: str | None
+    #: Whether the backend has a Telegram bot configured.
+    telegram_available: bool
+    telegram_connected: bool
+    #: The connected Telegram account's @username or first name.
+    telegram_name: str | None
+
+
+class AccountSettingsUpdate(BaseModel):
+    email_alerts: bool
+
+
+class TelegramLink(BaseModel):
+    #: Opens the bot in Telegram; pressing Start there connects the chat.
+    url: str
+    expires_at: datetime
+
+
+class AlertEmailChange(BaseModel):
+    email: str = Field(max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class AlertEmailConfirm(BaseModel):
+    token: str = Field(min_length=1, max_length=200)
+
+
+class AlertEmailConfirmed(BaseModel):
+    email: str
+
+
+class RegionKind(str, Enum):
+    province = "province"
+    department = "department"
+
+
+class RegionStat(BaseModel):
+    code: str
+    name: str
+    #: The department's province. Null for provinces.
+    province_name: str | None
+    detection_count: int
+    max_probability: float
+
+
+class HourStat(BaseModel):
+    #: Hour of the day, Argentina time (UTC-3).
+    hour: int
+    detection_count: int
+
+
+class RecurrenceCell(BaseModel):
+    #: The cell's center.
+    lat: float
+    lon: float
+    #: Distinct days (Argentina time) with at least one detection in the cell.
+    fire_days: int
+    #: Distinct years with at least one detection.
+    years: int
+    detection_count: int
+    last_image_time: datetime
+
+
+class Recurrence(BaseModel):
+    #: Side of each cell, in degrees.
+    cell_size_deg: float
+    cells: list[RecurrenceCell]
+
+
+class ReportStat(BaseModel):
+    verdict: ReportVerdict
+    category: ReportCategory | None
+    report_count: int

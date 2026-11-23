@@ -1,0 +1,88 @@
+<script setup lang="ts">
+import type { NavigationMenuItem } from "@nuxt/ui";
+
+const open = ref(false);
+
+const links = [
+  {
+    label: "Mapa",
+    icon: "i-lucide-map",
+    to: "/mapa",
+    onSelect: () => {
+      open.value = false;
+    },
+  },
+  {
+    label: "Estadísticas",
+    icon: "i-lucide-chart-column",
+    to: "/estadisticas",
+    onSelect: () => {
+      open.value = false;
+    },
+  },
+  {
+    label: "Alertas",
+    icon: "i-lucide-bell",
+    to: "/alertas",
+    onSelect: () => {
+      open.value = false;
+    },
+  },
+] satisfies NavigationMenuItem[];
+
+const groups = computed(() => [
+  {
+    id: "links",
+    label: "Ir a",
+    items: links.flat(),
+  },
+]);
+</script>
+
+<template>
+  <UDashboardGroup unit="rem">
+    <UDashboardSidebar
+      id="default"
+      v-model:open="open"
+      collapsible
+      resizable
+      class="bg-elevated/25"
+      :ui="{ footer: 'lg:border-t lg:border-default' }"
+    >
+      <template #header="{ collapsed }">
+        <div class="flex items-center gap-2">
+          <img src="/icon.png" alt="AlertaFuego" class="size-6 shrink-0" />
+          <span
+            v-if="!collapsed"
+            class="text-highlighted truncate font-semibold"
+          >
+            AlertaFuego
+          </span>
+        </div>
+      </template>
+
+      <template #default="{ collapsed }">
+        <UDashboardSearchButton
+          :collapsed="collapsed"
+          class="ring-default bg-transparent"
+        />
+
+        <UNavigationMenu
+          :collapsed="collapsed"
+          :items="links"
+          orientation="vertical"
+          tooltip
+          popover
+        />
+      </template>
+
+      <template #footer="{ collapsed }">
+        <UserMenu :collapsed="collapsed" />
+      </template>
+    </UDashboardSidebar>
+
+    <UDashboardSearch :groups="groups" />
+
+    <slot />
+  </UDashboardGroup>
+</template>
