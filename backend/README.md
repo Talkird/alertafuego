@@ -56,9 +56,30 @@ pytest --cov
 
 `tests/unit/` cubre la lógica del modelo y de la API sin red (Earth Engine simulado). `tests/api/` prueba cada endpoint contra una base PostGIS de prueba, que las pruebas migran con Alembic y vacían después de cada caso. Se configura con `TEST_DATABASE_URL` (por defecto, `postgresql+psycopg://postgres:postgres@localhost:5432/alertafuego_test`; la base tiene que existir). Para correr solo las pruebas que no usan la base: `pytest -m "not db"`.
 
+## Cómo usar el *dataset* descargado
+
+El *dataset* de entrenamiento no se incluye en el repositorio. Se distribuye aparte como `alertafuego-dataset-compressed.zip` (2,6 GB comprimido, unos 10 GB descomprimido). El zip contiene una carpeta `dataset/`, que tiene que quedar en `model/dataset/`:
+
+```bash
+unzip alertafuego-dataset-compressed.zip -d model/   # desde esta carpeta (backend/)
+ls model/dataset                                      # 2025-04 … 2026-03, manifest.csv y manifest_holdout.csv
+```
+
+- Trae un mes por carpeta, de abril de 2025 a marzo de 2026, con 145.547 recortes repartidos en `train/`, `val/` y `test/`.
+- Incluye el manifiesto combinado (`manifest.csv`) con rutas relativas, así que no hace falta correr `export_dataset` ni `merge_datasets`, ni tener acceso a Earth Engine.
+- Los manifiestos de cada mes tienen rutas con `\` porque se exportaron en Windows. Solo se usan si se vuelve a correr `merge_datasets`.
+
+Para comprobar que quedó bien, se evalúa uno de los modelos sobre el conjunto de prueba (en CPU tarda menos de un minuto):
+
+```bash
+python -m model.scripts.evaluate_model --checkpoint-dir model/checkpoints/d-noleak --split test
+```
+
+Con el *dataset* en su lugar se puede evaluar por recorte y reentrenar, como se describe en [Cómo entrenar](#cómo-entrenar). La evaluación sobre escenas completas (`evaluate_scenes`), de la que salen los resultados principales del proyecto, descarga las escenas desde Earth Engine y no usa este *dataset*: requiere un proyecto de Google Cloud con Earth Engine habilitado.
+
 ## Cómo construir el *dataset*
 
-El *dataset* de entrenamiento no se incluye en el repositorio. Se construye desde Earth Engine: para cada detección de VIIRS busca la imagen GOES-19 más cercana en el tiempo y guarda un recorte de 16 bandas calibradas con su máscara de fuego. Se exporta un mes por carpeta:
+Sin el zip, el *dataset* se construye desde Earth Engine: para cada detección de VIIRS busca la imagen GOES-19 más cercana en el tiempo y guarda un recorte de 16 bandas calibradas con su máscara de fuego. Se exporta un mes por carpeta:
 
 ```bash
 python -m model.scripts.export_dataset \
@@ -93,8 +114,8 @@ Cada época guarda el *checkpoint* con mejor F2 en validación. Al terminar, el 
 Evaluación:
 
 ```bash
-# Por recorte, con varios umbrales y por estrato horario
-python -m model.scripts.evaluate_model --checkpoint-dir model/checkpoints/d-noleak --by-stratum
+# Por recorte sobre el conjunto de prueba, con varios umbrales y por estrato horario (sin --split, evalúa la validación)
+python -m model.scripts.evaluate_model --checkpoint-dir model/checkpoints/d-noleak --split test --by-stratum
 
 # Sobre escenas completas de Argentina, como en operación
 python -m model.scripts.evaluate_scenes fetch        # descarga unas 30 escenas, una vez

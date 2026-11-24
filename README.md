@@ -70,9 +70,9 @@ Las pruebas de la API del *backend* usan una base PostGIS de prueba (`TEST_DATAB
 # Modelo
 
 - Los pesos de los dos modelos del sistema, b-shift y d-noleak, están en [`backend/model/checkpoints/`](backend/model/checkpoints), con sus métricas y curvas de entrenamiento.
-- El *dataset* de entrenamiento no se incluye. Se construye desde Earth Engine con `python -m model.scripts.export_dataset` (un mes por carpeta) y `python -m model.scripts.merge_datasets`.
+- El *dataset* de entrenamiento (145.547 recortes, de abril de 2025 a marzo de 2026, unos 10 GB) no está en el repositorio. Se distribuye aparte como `alertafuego-dataset-compressed.zip`: descomprimido dentro de `backend/model/`, queda en `backend/model/dataset/` y permite evaluar y entrenar sin Earth Engine. También se puede construir desde Earth Engine con `python -m model.scripts.export_dataset` (un mes por carpeta) y `python -m model.scripts.merge_datasets`.
 - Se entrena con `python -m model.scripts.train_model --epochs 30`, preferentemente en una GPU con CUDA.
-- El detalle está en las secciones de *dataset* y entrenamiento de [`backend/README.md`](backend/README.md#cómo-construir-el-dataset).
+- El detalle está en las secciones de *dataset* y entrenamiento de [`backend/README.md`](backend/README.md#cómo-usar-el-dataset-descargado).
 
 # API
 
